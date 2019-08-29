@@ -5,11 +5,11 @@ from itertools import chain
 from typing import Optional
 
 from construct import Construct, Struct, BitStruct, Const, Nibble, Checksum, Padding, Bytes, this, RawCopy, Int8ub, \
-    Default, Enum, Flag, BitsInteger, Int16ub, Container, EnumIntegerString
-
-from .common import calculate_checksum, ProductIdEnum, CommunicationSourceIDEnum
+    Default, Enum, Flag, BitsInteger, Int16ub, Container, EnumIntegerString, Rebuild
 
 from paradox.config import config as cfg
+from paradox.lib import ps
+from .common import calculate_checksum, ProductIdEnum, CommunicationSourceIDEnum, HexInt
 
 logger = logging.getLogger('PAI').getChild(__name__)
 
@@ -28,15 +28,17 @@ def iterate_properties(data):
 class Panel:
     mem_map = {}
     event_map = {}
+    property_map = {}
 
-    def __init__(self, core, product_id):
+    def __init__(self, core, product_id, variable_message_length = True):
         self.core = core
         self.product_id = product_id
+        self.variable_message_length = variable_message_length
 
     def parse_message(self, message, direction='topanel') -> Optional[Container]:
         if message is None or len(message) == 0:
             return None
-        
+
         if direction == 'topanel':
             if message[0] == 0x72 and message[1] == 0:
                 return InitiateCommunication.parse(message)
@@ -57,7 +59,8 @@ class Panel:
         else:
             raise ResourceWarning('{} parser not found'.format(name))
 
-    def get_error_message(self, error_code) -> str:
+    @staticmethod
+    def get_error_message(error_code) -> str:
         # This is from EVO and may not apply to all panels
 
         error_str = str(error_code)
@@ -101,7 +104,8 @@ class Panel:
 
         return message
 
-    def encode_password(self, password) -> bytes:
+    @staticmethod
+    def encode_password(password) -> bytes:
         res = [0] * 2
 
         if password is None:
@@ -134,7 +138,7 @@ class Panel:
 
         return bytes(res)
 
-    def update_labels(self):
+    async def update_labels(self):
         logger.info("Updating Labels from Panel")
 
         for elem_type in self.mem_map['elements']:
@@ -145,13 +149,15 @@ class Panel:
             if limits is not None:
                 addresses = [a for i, a in enumerate(addresses) if i + 1 in limits]
 
-            self.load_labels(self.core.data[elem_type],
+            await self.load_labels(self.core.data[elem_type],
                              addresses,
                              label_offset=elem_def['label_offset'])
 
             logger.info("{}: {}".format(elem_type.title(), ', '.join([v["label"] for v in self.core.data[elem_type].values()])))
 
-    def load_labels(self,
+        ps.sendMessage('labels_loaded', data=self.core.data)
+
+    async def load_labels(self,
                     data_dict,
                     addresses,
                     field_length=16,
@@ -164,39 +170,29 @@ class Panel:
 
         for address in list(addresses):
             args = dict(address=address, length=field_length)
-            reply = self.core.send_wait(self.get_message('ReadEEPROM'), args, reply_expected=0x05)
+            reply = await self.core.send_wait(self.get_message('ReadEEPROM'), args, reply_expected=lambda m: m.fields.value.po.command == 0x05 and m.fields.value.address == address)
 
-            retry_count = 3
-            for retry in range(1, retry_count + 1):
-                # Avoid errors due to collision with events. It should not come here as we use reply_expected=0x05
-                if reply is None:
-                    logger.error("Could not fully load labels")
-                    return
-
-                if reply.fields.value.address != address:
-                    logger.debug(
-                        "EEPROM label addresses do not match (received: %d, requested: %d). Retrying %d of %d" % (
-                            reply.fields.value.address, address, retry, retry_count))
-                    reply = self.core.send_wait(None, None, reply_expected=0x05)
-                    continue
-
-                if retry == retry_count:
-                    logger.error('Failed to fetch label at address: %d' % address)
-
-                break
+            if reply is None:
+                logger.error("Could not fully load labels")
+                return
 
             data = reply.fields.value.data
             b_label = data[label_offset:label_offset + field_length].strip(b'\0 ')
 
             key = b_label \
                 .replace(b'\0', b'_') \
-                .replace(b' ', b'_') \
-                .replace(b' ', b'_') \
-                .decode('utf-8')
+                .replace(b' ', b'_')
 
-            label = b_label \
-                .replace(b'\0', b' ') \
-                .decode('utf-8')
+            label = b_label.replace(b'\0', b' ')
+
+            try:
+                key = key.decode(cfg.LABEL_ENCODING)
+                label = label.decode(cfg.LABEL_ENCODING)
+            except UnicodeDecodeError:
+                logger.warn('Unable to properly decode label {} using the {} encoding.\n \
+                    Specify a different encoding using the LABEL_ENCODING configuration option.'.format(b_label, cfg.LABEL_ENCODING))
+                key = key.decode('utf-8', errors='ignore')
+                label = label.decode('utf-8', errors='ignore')
 
             properties = template.copy()
             properties['id'] = index
@@ -286,9 +282,9 @@ InitiateCommunicationResponse = Struct("fields" / RawCopy(
                         CONTROLLER_APPLICATION=1,
                         MODULE_APPLICATION=2),
         "application" / Struct(
-            "version" / Int8ub,
-            "revision" / Int8ub,
-            "build" / Int8ub),
+            "version" / HexInt,
+            "revision" / HexInt,
+            "build" / HexInt),
         "serial_number" / Bytes(4),
         "hardware" / Struct(
             "version" / Int8ub,
@@ -323,7 +319,7 @@ StartCommunicationResponse = Struct("fields" / RawCopy(
                          "status" / Struct(
                              "reserved" / Flag,
                              "alarm_reporting_pending" / Flag,
-                             "Windload_connected" / Flag,
+                             "Winload_connected" / Flag,
                              "NeWare_connected" / Flag)
                          ),
         "_not_used0" / Bytes(3),
@@ -350,3 +346,15 @@ StartCommunicationResponse = Struct("fields" / RawCopy(
         "_not_used2" / Bytes(14),
     )),
     "checksum" / Checksum(Bytes(1), lambda data: calculate_checksum(data), this.fields.data))
+
+CloseConnection = Struct("fields" / RawCopy(
+    Struct(
+        "po" / Struct(
+            "command" / Const(0x70, Int8ub)
+        ),
+        "length" / Rebuild(Int8ub, lambda
+            this: this._root._subcons.fields.sizeof() + this._root._subcons.checksum.sizeof()),
+        "_not_used0" / Padding(34),
+    )),
+    "checksum" / Checksum(Bytes(1), lambda data: calculate_checksum(data), this.fields.data))
+

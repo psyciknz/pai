@@ -1,10 +1,8 @@
 import logging
 from ..panel import Panel_EVOBase
-from typing import Optional
-
-from construct import Container
 
 logger = logging.getLogger('PAI').getChild(__name__)
+
 
 class Panel_EVOHD(Panel_EVOBase):
     mem_map = {
@@ -39,7 +37,3 @@ class Panel_EVOHD(Panel_EVOBase):
             }
         }
     }
-
-    def request_status(self, i) -> Optional[Container]:
-        logger.warning("Status requesting for EVOHD is not implemented")
-        return None

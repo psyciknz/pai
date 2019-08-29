@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 
+import asyncio
+import binascii
 import inspect
 import logging
 import sys
 import time
 from typing import Optional
 
+from paradox.config import config as cfg
+from paradox.paradox import PublishPropertyChange
+from .event import event_map
+from .property import property_map
 from .parsers import Construct, CloseConnection, ErrorMessage, InitializeCommunication, InitializeCommunicationResponse, \
     SetTimeDate, SetTimeDateResponse, PerformAction, PerformActionResponse, ReadStatusResponse, ReadEEPROM, \
-    ReadEEPROMResponse, LiveEvent, RAMDataParserMap, Container
+    ReadEEPROMResponse, LiveEvent, RAMDataParserMap, Container, ChecksumError
 from ..panel import Panel as PanelBase
-
-from .event import event_map
-from paradox.paradox import PublishPropertyChange
-
-from paradox.config import config as cfg
 
 logger = logging.getLogger('PAI').getChild(__name__)
 
@@ -26,6 +27,7 @@ PGM_ACTIONS = dict(on_override=0x30, off_override=0x31, on=0x32, off=0x33, pulse
 class Panel(PanelBase):
 
     event_map = event_map
+    property_map = property_map
 
     mem_map = {
         "status_base1": 0x8000,
@@ -46,24 +48,17 @@ class Panel(PanelBase):
         }
     }
 
-    def get_message(self, name) -> Construct:
+    def get_message(self, name: str) -> Construct:
         try:
-            return super(Panel, self).get_message(name)
-        except ResourceWarning as e:
             clsmembers = dict(inspect.getmembers(sys.modules[__name__]))
             if name in clsmembers:
                 return clsmembers[name]
-            else:
-                raise e
+        except ResourceWarning:
+            pass
 
-    def update_labels(self):
-        logger.info("Updating Labels from Panel")
+        return super(Panel, self).get_message(name)
 
-        super(Panel, self).update_labels()
-
-        logger.debug("Labels updated")
-
-    def parse_message(self, message, direction='topanel') -> Optional[Container]:
+    def parse_message(self, message: bytes, direction='topanel') -> Optional[Container]:
         try:
             if message is None or len(message) == 0:
                 return None
@@ -105,25 +100,26 @@ class Panel(PanelBase):
                 elif message[0] >> 4 == 0x0e:
                     return LiveEvent.parse(message)
 
+        except ChecksumError as e:
+            logger.error("ChecksumError %s, message: %s" % (str(e), binascii.hexlify(message)))
         except Exception:
-            logger.exception("Parsing message: %s" % (" ".join("{:02x} ".format(c) for c in message)))
-
+            logger.exception("Exception parsing message: %s" % (binascii.hexlify(message)))
         return None
 
-    def initialize_communication(self, reply, PASSWORD):
-        password = self.encode_password(PASSWORD)
+    async def initialize_communication(self, reply: Container, password):
+        encoded_password = self.encode_password(password)
 
         args = dict(product_id=reply.fields.value.product_id,
                     firmware=reply.fields.value.firmware,
                     panel_id=reply.fields.value.panel_id,
-                    pc_password=password,
+                    pc_password=encoded_password,
                     user_code=0x000000,
                     _not_used1=0x19,
                     source_id=0x02
                     )
 
         logger.info("Initializing communication")
-        reply = self.core.send_wait(self.get_message('InitializeCommunication'), args=args)
+        reply = await self.core.send_wait(self.get_message('InitializeCommunication'), args=args, reply_expected=0x10)
 
         if reply is None:
             logger.error("Initialization Failed")
@@ -136,28 +132,28 @@ class Panel(PanelBase):
             logger.error("Authentication Failed. Wrong Password?")
             return False
 
-    def request_status(self, i):
+    async def request_status(self, i: int):
         args = dict(address=self.mem_map['status_base1'] + i)
-        reply = self.core.send_wait(ReadEEPROM, args, reply_expected=0x05)
+        reply = await self.core.send_wait(ReadEEPROM, args, reply_expected=0x05)
 
         return reply
 
-    def handle_status(self, message):
+    def handle_status(self, message: Container):
         """Handle MessageStatus"""
-        vars = message.fields.value
+        mvars = message.fields.value
 
-        if vars.address not in RAMDataParserMap:
-            logger.warn("Unknown memory address {}".format(vars.address))
+        if mvars.address not in RAMDataParserMap:
+            logger.warn("Unknown memory address {}".format(mvars.address))
             return
 
-        parser = RAMDataParserMap[vars.address]
+        parser = RAMDataParserMap[mvars.address]
         try:
-            properties = parser.parse(vars.data)
+            properties = parser.parse(mvars.data)
         except Exception:
             logger.exception("Unable to parse RAM Status Block")
             return
 
-        if vars.address == 0:
+        if mvars.address == 0:
             if time.time() - self.core.last_power_update >= cfg.POWER_UPDATE_INTERVAL:
                 force = PublishPropertyChange.YES if cfg.PUSH_POWER_UPDATE_WITHOUT_CHANGE else PublishPropertyChange.NO
 
@@ -178,12 +174,12 @@ class Panel(PanelBase):
 
                 self.core.update_properties('system', 'troubles', {k: properties.troubles[k]})
 
-            self.process_properties_bulk(properties, vars.address)
+            self.process_properties_bulk(properties, mvars.address)
 
-        elif vars.address >= 1 and vars.address <= 5:
-            self.process_properties_bulk(properties, vars.address)
+        elif 1 <= mvars.address <= 5:
+            self.process_properties_bulk(properties, mvars.address)
 
-    def control_zones(self, zones, command) -> bool:
+    async def control_zones(self, zones: list, command: str) -> bool:
         """
         Control zones
         :param list zones: a list of zones
@@ -197,14 +193,14 @@ class Panel(PanelBase):
 
         for zone in zones:
             args = dict(action=ZONE_ACTIONS[command], argument=(zone - 1))
-            reply = self.core.send_wait(PerformAction, args, reply_expected=0x04)
+            reply = await self.core.send_wait(PerformAction, args, reply_expected=0x04)
 
             if reply is not None:
                 accepted = True
 
         return accepted
 
-    def control_partitions(self, partitions, command) -> bool:
+    async def control_partitions(self, partitions: list, command: str) -> bool:
         """
         Control Partitions
         :param list partitions: a list of partitions
@@ -218,14 +214,14 @@ class Panel(PanelBase):
 
         for partition in partitions:
             args = dict(action=PARTITION_ACTIONS[command], argument=(partition - 1))
-            reply = self.core.send_wait(PerformAction, args, reply_expected=0x04)
+            reply = await self.core.send_wait(PerformAction, args, reply_expected=0x04)
 
             if reply is not None:
                 accepted = True
 
         return accepted
 
-    def control_outputs(self, outputs, command) -> bool:
+    async def control_outputs(self, outputs, command) -> bool:
         """
         Control PGM
         :param list outputs: a list of pgms
@@ -240,18 +236,18 @@ class Panel(PanelBase):
         for output in outputs:
             if command == 'pulse':
                 args = dict(action=PGM_ACTIONS['on'], argument=(output - 1))
-                reply = self.core.send_wait(PerformAction, args, reply_expected=0x04)
-                if reply is not None:
-                    accepted = True
+                reply = await self.core.send_wait(PerformAction, args, reply_expected=0x04)
+                if reply is None:
+                    continue
 
-                time.sleep(1)
+                await asyncio.sleep(cfg.OUTPUT_PULSE_DURATION)
                 args = dict(action=PGM_ACTIONS['off'], argument=(output - 1))
-                reply = self.core.send_wait(PerformAction, args, reply_expected=0x04)
+                reply = await self.core.send_wait(PerformAction, args, reply_expected=0x04)
                 if reply is not None:
                     accepted = True
             else:
                 args = dict(action=PGM_ACTIONS[command], argument=(output - 1))
-                reply = self.core.send_wait(PerformAction, args, reply_expected=0x04)
+                reply = await self.core.send_wait(PerformAction, args, reply_expected=0x04)
                 if reply is not None:
                     accepted = True
 
